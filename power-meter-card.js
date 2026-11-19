@@ -11,7 +11,7 @@
 // Entities default to sensor.<key>_<device>; override any of them under
 // `entities:` (keys: power, total, returning, l1-l3, i1-i3, u1-u3).
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const HISTORY_REFRESH_MS = 5 * 60 * 1000;
 const MISSING = new Set(["unavailable", "unknown", "", "undefined", "null"]);
 const KEYS = ["power", "total", "returning", "l1", "l2", "l3", "i1", "i2", "i3", "u1", "u2", "u3"];
@@ -34,6 +34,7 @@ const STRINGS = {
     missing: "Entity {entity} not found.",
     max_phase: "Highest load {phase}",
     chart_empty: "No history yet.",
+    avg: "{min} min average",
   },
   sv: {
     title: "Elmätare",
@@ -51,6 +52,7 @@ const STRINGS = {
     missing: "Entiteten {entity} hittades inte.",
     max_phase: "Högst belastad {phase}",
     chart_empty: "Ingen historik än.",
+    avg: "medel per {min} min",
   },
 };
 
@@ -89,6 +91,25 @@ function niceMax(value) {
   const mag = 10 ** Math.floor(Math.log10(value));
   for (const m of [1, 2, 2.5, 5, 10]) if (m * mag >= value) return m * mag;
   return 10 * mag;
+}
+
+/** Time-weighted mean of a step series in n buckets of `size` ms from t0; null where there is no data. */
+function bucketMeans(pts, t0, t1, size, n) {
+  const sum = new Array(n).fill(0);
+  const dur = new Array(n).fill(0);
+  for (let i = 0; i < pts.length; i++) {
+    let a = Math.max(pts[i].t, t0);
+    const b = Math.min(i + 1 < pts.length ? pts[i + 1].t : t1, t1);
+    while (a < b) {
+      const k = Math.min(n - 1, Math.floor((a - t0) / size));
+      const e = Math.min(b, t0 + (k + 1) * size);
+      if (e <= a) break;
+      sum[k] += pts[i].v * (e - a);
+      dur[k] += e - a;
+      a = e;
+    }
+  }
+  return sum.map((v, k) => (dur[k] > 0 ? v / dur[k] : null));
 }
 
 const STYLES = `
@@ -136,7 +157,7 @@ const STYLES = `
   .gauge .fill { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 5px; background: var(--success-color, #43a047); opacity: .75; }
   .gauge .fill.warning { background: var(--warning-color, #ffa600); }
   .gauge .fill.error { background: var(--error-color, #db4437); }
-  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--secondary-text-color); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 8px; font-size: 11px; color: var(--secondary-text-color); }
   .legend i { display: inline-block; width: 12px; height: 8px; margin-right: 4px; vertical-align: middle; border-radius: 2px; }
   .legend i.line { height: 2px; }
   .empty { color: var(--secondary-text-color); font-size: 14px; padding: 8px 0; }
@@ -145,8 +166,28 @@ const STYLES = `
   svg text { font-size: 10px; fill: var(--secondary-text-color); font-family: inherit; }
   .grid-line { stroke: var(--divider-color); stroke-width: 1; }
   .now { stroke: var(--primary-text-color); stroke-width: 1; opacity: 0.6; }
-  .area { fill: color-mix(in srgb, var(--warning-color, #ffa600) 30%, transparent); stroke: var(--warning-color, #ffa600); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-  .pl { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  svg.power-chart { touch-action: pan-y; cursor: crosshair; }
+  svg.power-chart text { font-size: 11px; }
+  .chart-wrap { position: relative; }
+  .stack { opacity: 0.45; stroke: none; }
+  .stack-line { fill: none; stroke-width: 1.5; stroke-linejoin: round; }
+  .cursor { stroke: var(--primary-text-color); stroke-width: 1; opacity: 0.5; pointer-events: none; }
+  .tip { position: absolute; top: 0; pointer-events: none; display: flex; flex-direction: column; gap: 2px; min-width: 120px;
+    padding: 6px 8px; border-radius: 8px; font-size: 12px; line-height: 16px; color: var(--primary-text-color);
+    background: var(--card-background-color, #fff); border: 1px solid var(--divider-color); box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15); }
+  .tip[hidden] { display: none; }
+  .tip .time { color: var(--secondary-text-color); font-size: 11px; }
+  .tip .row { display: flex; align-items: center; gap: 6px; }
+  .tip .row b { margin-left: auto; font-weight: 500; padding-left: 12px; }
+  .tip .row.total b { font-weight: 600; }
+  .tip .row.off { opacity: 0.45; }
+  .tip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
+  .legend .toggle { all: unset; cursor: pointer; display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 12px;
+    border: 1px solid var(--divider-color); color: var(--primary-text-color); font-size: 12px; }
+  .legend .toggle:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
+  .legend .toggle.off { opacity: 0.45; text-decoration: line-through; }
+  .legend .toggle i { margin-right: 6px; }
+  .legend .unit-label { margin-left: auto; align-self: center; }
   .bar { fill: var(--warning-color, #ffa600); opacity: 0.55; }
   .bar.current { opacity: 1; }
   .bar-label { font-size: 9px; }
@@ -157,7 +198,25 @@ class PowerMeterCard extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._seen = new Map();
+    this._hidden = new Set();
+    this._hoverIdx = null;
     this.shadowRoot.addEventListener("click", (ev) => this._onClick(ev));
+    this.shadowRoot.addEventListener("pointermove", (ev) => this._hover(ev));
+    this.shadowRoot.addEventListener("pointerdown", (ev) => this._hover(ev));
+    this.shadowRoot.addEventListener(
+      "pointerleave",
+      (ev) => {
+        if (ev.target?.classList?.contains("power-chart")) this._unhover();
+      },
+      true,
+    );
+    this._resize = new ResizeObserver(() => {
+      const width = (this.shadowRoot.querySelector(".content")?.clientWidth || this.clientWidth) - 32;
+      if (width > 0 && Math.abs(width - (this._width || 0)) >= 4) {
+        this._width = width;
+        this._render();
+      }
+    });
   }
 
   static getStubConfig(hass) {
@@ -198,6 +257,7 @@ class PowerMeterCard extends HTMLElement {
   }
 
   connectedCallback() {
+    this._resize.observe(this);
     this._timer = setInterval(() => {
       this._history = null;
       this._stats = null;
@@ -206,6 +266,7 @@ class PowerMeterCard extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._resize.disconnect();
     clearInterval(this._timer);
     this._timer = undefined;
   }
@@ -285,6 +346,14 @@ class PowerMeterCard extends HTMLElement {
   }
 
   _onClick(ev) {
+    const toggle = ev.composedPath().find((el) => el.dataset && el.dataset.toggle);
+    if (toggle) {
+      const p = Number(toggle.dataset.toggle);
+      if (this._hidden.has(p)) this._hidden.delete(p);
+      else this._hidden.add(p);
+      this._render();
+      return;
+    }
     const target = ev.composedPath().find((el) => el.dataset && el.dataset.more);
     const entityId = target && this._ids[target.dataset.more];
     if (entityId) this.dispatchEvent(new CustomEvent("hass-more-info", { detail: { entityId }, bubbles: true, composed: true }));
@@ -384,6 +453,7 @@ class PowerMeterCard extends HTMLElement {
       }
     }
     this.shadowRoot.innerHTML = `<style>${STYLES}</style><ha-card>${this.renderHeader()}${body}</ha-card>`;
+    if (this._hoverIdx !== null) this._showTip();
   }
 
   renderHeader() {
@@ -459,14 +529,16 @@ class PowerMeterCard extends HTMLElement {
 
   renderChart(now) {
     const hours = this._config.hours_to_show;
+    const size = Math.max(1, Number(this._config.bucket_minutes) || 5) * 60000;
     const t0 = now - hours * 3600000;
-    const W = 300;
-    const H = 120;
-    const plot = { x0: 30, x1: W - 4, y0: 6, y1: H - 16 };
-    const x = (t) => plot.x0 + ((t - t0) / (now - t0)) * (plot.x1 - plot.x0);
+    const W = this._chartWidth();
+    const H = 150;
+    const plot = { x0: 30, x1: W - 2, y0: 8, y1: H - 18 };
+    const title = `<div class="section"><span>${esc(this.t("chart", { hours }))}</span><span>${esc(this.t("avg", { min: size / 60000 }))}</span></div>`;
 
     // Step series clipped to the window, extended to now with the live value.
     const series = (key) => {
+      if (!this._ids[key]) return [];
       const pts = this.points(key);
       let before = null;
       const inside = [];
@@ -476,55 +548,137 @@ class PowerMeterCard extends HTMLElement {
       if (inside.length && live !== null) inside.push({ t: now, v: live });
       return inside;
     };
-    const total = this._ids.power ? series("power") : [];
-    const phases = PHASES.map((p) => ({ p, pts: this._ids[`l${p}`] ? series(`l${p}`) : [] })).filter((s) => s.pts.length > 1);
-    if (total.length < 2 && !phases.length) {
-      return `<div class="section"><span>${esc(this.t("chart", { hours }))}</span></div><div class="empty">${esc(this.t(this._history ? "chart_empty" : "chart_empty"))}</div>`;
-    }
+    const n = Math.ceil((now - t0) / size);
+    const total = bucketMeans(series("power"), t0, now, size, n);
+    const phases = PHASES.map((p) => ({ p, v: bucketMeans(series(`l${p}`), t0, now, size, n) })).filter((s) => s.v.some((v) => v !== null));
+    const has = (arr) => arr.some((v) => v !== null);
+    if (!has(total) && !phases.length) return `${title}<div class="empty">${esc(this.t("chart_empty"))}</div>`;
 
-    const max = niceMax(Math.max(1, ...total.map((p) => p.v), ...phases.flatMap((s) => s.pts.map((p) => p.v))));
+    // Stack the visible phases (L1 at the bottom); without phases, plot the total.
+    const hidden = this._hidden;
+    const shown = phases.filter((s) => !hidden.has(s.p));
+    const layers = [];
+    const base = new Array(n).fill(0);
+    if (phases.length) {
+      for (const s of shown) {
+        const lower = base.slice();
+        for (let k = 0; k < n; k++) base[k] += Math.max(0, s.v[k] ?? 0);
+        layers.push({ cls: "stack", color: PHASE_COLORS[s.p], lower, upper: base.slice() });
+      }
+    } else {
+      for (let k = 0; k < n; k++) base[k] = Math.max(0, total[k] ?? 0);
+      layers.push({ cls: "stack total", color: "var(--warning-color, #ffa600)", lower: new Array(n).fill(0), upper: base.slice() });
+    }
+    const valid = (k) => total[k] !== null || phases.some((s) => s.v[k] !== null);
+    let first = 0;
+    while (first < n && !valid(first)) first++;
+
+    const max = niceMax(Math.max(1, ...base, ...phases.flatMap((s) => s.v.map((v) => v ?? 0))));
+    const kw = max >= 2000;
+    const x = (t) => plot.x0 + ((t - t0) / (now - t0)) * (plot.x1 - plot.x0);
+    const cx = (k) => x(Math.min(now, t0 + (k + 0.5) * size));
     const y = (v) => plot.y1 - (Math.max(0, v) / max) * (plot.y1 - plot.y0);
-    const step = (pts) => {
-      let d = "";
-      pts.forEach((p, i) => {
-        const px = x(p.t).toFixed(1);
-        d += i === 0 ? `M${px},${y(p.v).toFixed(1)}` : `H${px}V${y(p.v).toFixed(1)}`;
-      });
-      return d;
-    };
 
     const parts = [];
     for (const f of [0, 0.5, 1]) {
       const yy = y(max * f).toFixed(1);
       parts.push(`<line class="grid-line" x1="${plot.x0}" x2="${plot.x1}" y1="${yy}" y2="${yy}"/>`);
-      parts.push(`<text x="${plot.x0 - 4}" y="${Number(yy) + 3}" text-anchor="end">${esc(max >= 2000 ? this.n((max * f) / 1000, max * f % 1000 ? 1 : 0) : this.n(max * f, 0))}</text>`);
+      const label = kw ? this.n((max * f) / 1000, (max * f) % 1000 ? 1 : 0) : this.n(max * f, 0);
+      parts.push(`<text x="${plot.x0 - 6}" y="${Number(yy) + 4}" text-anchor="end">${esc(label)}</text>`);
     }
-    if (total.length > 1) {
-      const line = step(total);
-      parts.push(`<path class="area" d="${line}V${plot.y1}H${x(total[0].t).toFixed(1)}Z"><title>${esc(this.t("total_power"))}</title></path>`);
-    }
-    for (const s of phases) parts.push(`<path class="pl" style="stroke:${PHASE_COLORS[s.p]}" d="${step(s.pts)}"><title>L${s.p}</title></path>`);
-
-    const tickEvery = hours <= 12 ? 3 : hours <= 24 ? 6 : 12;
-    const first = new Date(t0);
-    first.setMinutes(0, 0, 0);
-    for (let t = first.getTime() + 3600000; t < now; t += 3600000) {
+    const tickEvery = hours <= 6 ? 1 : hours <= 12 ? 3 : hours <= 24 ? (W < 360 ? 6 : 3) : 12;
+    const firstHour = new Date(t0);
+    firstHour.setMinutes(0, 0, 0);
+    for (let t = firstHour.getTime() + 3600000; t < now; t += 3600000) {
       if (new Date(t).getHours() % tickEvery) continue;
       const xx = x(t).toFixed(1);
+      if (Number(xx) - plot.x0 < 16 || plot.x1 - Number(xx) < 16) continue;
       parts.push(`<line class="grid-line" x1="${xx}" x2="${xx}" y1="${plot.y0}" y2="${plot.y1}" opacity="0.5"/>`);
-      parts.push(`<text x="${xx}" y="${H - 2}" text-anchor="middle">${esc(this.clock(t))}</text>`);
+      parts.push(`<text x="${xx}" y="${H - 3}" text-anchor="middle">${esc(this.clock(t))}</text>`);
     }
-    parts.push(`<line class="now" x1="${plot.x1}" x2="${plot.x1}" y1="${plot.y0}" y2="${plot.y1}"/>`);
+    if (first < n) {
+      for (const l of layers) {
+        let d = "";
+        for (let k = first; k < n; k++) d += `${k === first ? "M" : "L"}${cx(k).toFixed(1)},${y(l.upper[k]).toFixed(1)}`;
+        const top = d;
+        for (let k = n - 1; k >= first; k--) d += `L${cx(k).toFixed(1)},${y(l.lower[k]).toFixed(1)}`;
+        parts.push(`<path class="${l.cls}" style="fill:${l.color}" d="${d}Z"/><path class="stack-line" style="stroke:${l.color}" d="${top}"/>`);
+      }
+    }
+    parts.push(`<line class="cursor" x1="0" x2="0" y1="${plot.y0}" y2="${plot.y1}" visibility="hidden"/>`);
+
+    this._chart = { n, first, t0, size, now, plot, cx, total, phases };
 
     const legend = [
-      total.length > 1 ? `<span><i style="background:color-mix(in srgb,var(--warning-color,#ffa600) 45%,transparent)"></i>${esc(this.t("total_power"))}</span>` : "",
-      ...phases.map((s) => `<span><i class="line" style="background:${PHASE_COLORS[s.p]}"></i>L${s.p}</span>`),
-      `<span>${max >= 2000 ? "kW" : "W"}</span>`,
+      ...(phases.length
+        ? phases.map(
+            (s) =>
+              `<button class="toggle ${hidden.has(s.p) ? "off" : ""}" data-toggle="${s.p}" aria-pressed="${!hidden.has(s.p)}"><i style="background:${PHASE_COLORS[s.p]}"></i>L${s.p}</button>`,
+          )
+        : [`<span><i style="background:var(--warning-color,#ffa600)"></i>${esc(this.t("total_power"))}</span>`]),
+      `<span class="unit-label">${kw ? "kW" : "W"}</span>`,
     ].join("");
 
-    return `<div class="section"><span>${esc(this.t("chart", { hours }))}</span></div>
-      <button class="link chart" data-more="power"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(this.t("chart", { hours }))}">${parts.join("")}</svg></button>
+    return `${title}
+      <div class="chart-wrap">
+        <svg class="power-chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(this.t("chart", { hours }))}">${parts.join("")}</svg>
+        <div class="tip" hidden></div>
+      </div>
       <div class="legend">${legend}</div>`;
+  }
+
+  _chartWidth() {
+    return Math.max(220, Math.round(this._width || 300));
+  }
+
+  _hover(ev) {
+    const c = this._chart;
+    const svg = ev.target.closest?.("svg.power-chart") || ev.composedPath().find((el) => el.classList?.contains("power-chart"));
+    if (!c || !svg) return this._unhover();
+    const rect = svg.getBoundingClientRect();
+    const px = ((ev.clientX - rect.left) / rect.width) * svg.viewBox.baseVal.width;
+    const t = c.t0 + ((px - c.plot.x0) / (c.plot.x1 - c.plot.x0)) * (c.now - c.t0);
+    const k = Math.max(c.first, Math.min(c.n - 1, Math.floor((t - c.t0) / c.size)));
+    this._hoverIdx = k;
+    this._showTip();
+  }
+
+  _unhover() {
+    this._hoverIdx = null;
+    this._showTip();
+  }
+
+  _showTip() {
+    const root = this.shadowRoot;
+    const tip = root.querySelector(".tip");
+    const cursor = root.querySelector(".cursor");
+    const c = this._chart;
+    const k = this._hoverIdx;
+    if (!tip || !cursor || !c || k === null || k === undefined || k < c.first || k >= c.n) {
+      if (tip) tip.hidden = true;
+      if (cursor) cursor.setAttribute("visibility", "hidden");
+      return;
+    }
+    const xx = c.cx(k);
+    cursor.setAttribute("x1", xx);
+    cursor.setAttribute("x2", xx);
+    cursor.setAttribute("visibility", "visible");
+    const start = c.t0 + k * c.size;
+    const end = Math.min(c.now, start + c.size);
+    const sum = c.phases.reduce((acc, s) => acc + (s.v[k] ?? 0), 0);
+    const totalV = c.total[k] ?? (c.phases.length ? sum : null);
+    const rows = c.phases
+      .map((s) => `<span class="row ${this._hidden.has(s.p) ? "off" : ""}"><i style="background:${PHASE_COLORS[s.p]}"></i>L${s.p}<b>${this.power(s.v[k])}</b></span>`)
+      .join("");
+    tip.innerHTML = `<span class="time">${esc(this.clock(start))}–${esc(this.clock(end))}</span>
+      <span class="row total">${esc(this.t("total_power"))}<b>${this.power(totalV)}</b></span>${rows}`;
+    tip.hidden = false;
+    const wrap = tip.parentElement.getBoundingClientRect();
+    const svg = root.querySelector("svg.power-chart");
+    const scale = svg ? svg.getBoundingClientRect().width / svg.viewBox.baseVal.width : 1;
+    const left = xx * scale;
+    const w = tip.offsetWidth;
+    tip.style.left = `${Math.max(0, Math.min(wrap.width - w, left > wrap.width / 2 ? left - w - 10 : left + 10))}px`;
   }
 
   renderDays(now) {
@@ -553,8 +707,8 @@ class PowerMeterCard extends HTMLElement {
     }
     if (!list.some((d) => d.v !== null)) return `<div class="section"><span>${esc(this.t("days"))}</span></div><div class="empty">${esc(this.t("chart_empty"))}</div>`;
 
-    const W = 300;
-    const H = 90;
+    const W = this._chartWidth();
+    const H = 100;
     const plot = { x0: 4, x1: W - 4, y0: 12, y1: H - 14 };
     const max = Math.max(...list.map((d) => d.v ?? 0), 0.1);
     const slot = (plot.x1 - plot.x0) / days;
@@ -573,7 +727,7 @@ class PowerMeterCard extends HTMLElement {
       parts.push(`<text x="${cx.toFixed(1)}" y="${H - 2}" text-anchor="middle">${esc(current ? this.t("today") : this.weekday(d.t))}</text>`);
     });
     return `<div class="section"><span>${esc(this.t("days"))}</span><span>kWh</span></div>
-      <button class="link chart" data-more="total"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(this.t("days"))}">${parts.join("")}</svg></button>`;
+      <button class="link chart" data-more="total"><svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(this.t("days"))}">${parts.join("")}</svg></button>`;
   }
 }
 

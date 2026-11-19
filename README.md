@@ -7,7 +7,7 @@ It shows:
 - current power, with export shown in green
 - energy used today
 - per-phase load (L1–L3) against your main fuse: power, current and voltage
-- a 24 h chart of total power and each phase
+- a 24 h chart of the phases stacked (top edge = total), as 5-minute averages, with a hover tooltip and clickable legend to hide phases
 - energy per day for the last 7 days, from long-term statistics
 - the meter reading and current export
 
@@ -43,6 +43,7 @@ fuse: 20
 | `title` | `Power meter` / `Elmätare` | Card title. |
 | `icon` | `mdi:meter-electric` | Header icon. |
 | `hours_to_show` | `24` | Length of the power chart, in hours. |
+| `bucket_minutes` | `5` | Averaging interval for the power chart, in minutes. Lower shows more detail, higher is smoother. |
 | `days_to_show` | `7` | Number of days in the energy chart (2–31). |
 | `show_chart` | `true` | Show the power chart. |
 | `show_days` | `true` | Show the energy-per-day chart. |
