@@ -10,8 +10,10 @@
 //
 // Entities default to sensor.<key>_<device>; override any of them under
 // `entities:` (keys: power, total, returning, l1-l3, i1-i3, u1-u3).
+// Optional `temperature:` sensor adds the daily mean temperature to the
+// energy-per-day chart.
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const HISTORY_REFRESH_MS = 5 * 60 * 1000;
 const MISSING = new Set(["unavailable", "unknown", "", "undefined", "null"]);
 const KEYS = ["power", "total", "returning", "l1", "l2", "l3", "i1", "i2", "i3", "u1", "u2", "u3"];
@@ -35,6 +37,7 @@ const STRINGS = {
     max_phase: "Highest load {phase}",
     chart_empty: "No history yet.",
     avg: "{min} min average",
+    mean_temp: "Mean temp.",
   },
   sv: {
     title: "Elmätare",
@@ -53,6 +56,7 @@ const STRINGS = {
     max_phase: "Högst belastad {phase}",
     chart_empty: "Ingen historik än.",
     avg: "medel per {min} min",
+    mean_temp: "Medeltemp.",
   },
 };
 
@@ -191,6 +195,13 @@ const STYLES = `
   .bar { fill: var(--warning-color, #ffa600); opacity: 0.55; }
   .bar.current { opacity: 1; }
   .bar-label { font-size: 9px; }
+  .temp-line { fill: none; stroke: var(--info-color, #039be5); stroke-width: 2; stroke-linejoin: round; }
+  .temp-dot { fill: var(--card-background-color, #fff); stroke: var(--info-color, #039be5); stroke-width: 2; }
+  svg text.temp-label { fill: var(--info-color, #039be5); font-size: 10px; }
+  .day-legend { display: inline-flex; gap: 10px; align-items: center; }
+  .swatch { display: inline-block; width: 10px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .bar-swatch { background: var(--warning-color, #ffa600); opacity: 0.7; }
+  .line-swatch { height: 2px; background: var(--info-color, #039be5); }
 `;
 
 class PowerMeterCard extends HTMLElement {
@@ -232,6 +243,7 @@ class PowerMeterCard extends HTMLElement {
       const id = config.entities?.[key] ?? (config.device ? `sensor.${key}_${config.device}` : null);
       if (id) this._ids[key] = id;
     }
+    if (config.temperature) this._ids.temperature = config.temperature;
     this._history = null;
     this._stats = null;
     this._seen.clear();
@@ -400,21 +412,22 @@ class PowerMeterCard extends HTMLElement {
 
   async _loadStats(start) {
     const id = this._ids.total;
+    const tempId = this._ids.temperature;
     if (this._loadingStats || !this._hass?.callWS || !id || !this._hass.states[id]) return;
     this._loadingStats = true;
     try {
       const data = await this._hass.callWS({
         type: "recorder/statistics_during_period",
         start_time: new Date(start).toISOString(),
-        statistic_ids: [id],
+        statistic_ids: tempId ? [id, tempId] : [id],
         period: "day",
-        types: ["change"],
+        types: ["change", "mean"],
         units: { energy: "kWh" },
       });
-      this._stats = { start, rows: data?.[id] || [] };
+      this._stats = { start, rows: data?.[id] || [], temps: tempId ? data?.[tempId] || [] : [] };
     } catch (err) {
       console.warn("Power meter card: statistics unavailable", err);
-      this._stats = { start, rows: [] };
+      this._stats = { start, rows: [], temps: [] };
     } finally {
       this._loadingStats = false;
       this._render();
@@ -688,28 +701,33 @@ class PowerMeterCard extends HTMLElement {
     start.setDate(start.getDate() - (days - 1));
     if (!this._stats || this._stats.start !== start.getTime()) queueMicrotask(() => this._loadStats(start.getTime()));
 
+    const dayOf = (r) => new Date(typeof r.start === "number" ? r.start : Date.parse(r.start)).setHours(0, 0, 0, 0);
     const byDay = new Map();
-    for (const r of this._stats?.rows || []) {
-      const d = new Date(typeof r.start === "number" ? r.start : Date.parse(r.start));
-      d.setHours(0, 0, 0, 0);
-      byDay.set(d.getTime(), toNumber(r.change));
-    }
+    for (const r of this._stats?.rows || []) byDay.set(dayOf(r), toNumber(r.change));
+    const tempByDay = new Map();
+    for (const r of this._stats?.temps || []) tempByDay.set(dayOf(r), toNumber(r.mean));
     // Statistics lag up to an hour; today's bar uses the live figure.
     const todayKey = new Date(now).setHours(0, 0, 0, 0);
     const today = this._today(now);
     if (today !== null) byDay.set(todayKey, today);
+    // Before the first hourly statistics of the day, fall back to the live temperature.
+    const tempState = this._hass.states[this._ids.temperature];
+    if (this._ids.temperature && !tempByDay.has(todayKey) && !isMissing(tempState)) tempByDay.set(todayKey, toNumber(tempState.state));
+    const tempUnit = tempState?.attributes?.unit_of_measurement || "°C";
 
     const list = [];
     for (let i = 0; i < days; i++) {
       const d = new Date(start);
       d.setDate(start.getDate() + i);
-      list.push({ t: d.getTime(), v: byDay.get(d.getTime()) ?? null });
+      list.push({ t: d.getTime(), v: byDay.get(d.getTime()) ?? null, temp: tempByDay.get(d.getTime()) ?? null });
     }
     if (!list.some((d) => d.v !== null)) return `<div class="section"><span>${esc(this.t("days"))}</span></div><div class="empty">${esc(this.t("chart_empty"))}</div>`;
 
     const W = this._chartWidth();
-    const H = 100;
-    const plot = { x0: 4, x1: W - 4, y0: 12, y1: H - 14 };
+    const temps = list.map((d) => d.temp).filter((v) => v !== null);
+    const hasTemp = temps.length > 0;
+    const H = hasTemp ? 116 : 100;
+    const plot = { x0: 4, x1: W - 4, y0: 12, y1: H - (hasTemp ? 30 : 14) };
     const max = Math.max(...list.map((d) => d.v ?? 0), 0.1);
     const slot = (plot.x1 - plot.x0) / days;
     const bw = Math.min(28, slot * 0.7);
@@ -720,13 +738,42 @@ class PowerMeterCard extends HTMLElement {
       const current = d.t === todayKey;
       if (d.v !== null) {
         parts.push(`<rect class="bar ${current ? "current" : ""}" x="${(cx - bw / 2).toFixed(1)}" y="${(plot.y1 - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(h, 0.5).toFixed(1)}" rx="2"><title>${esc(
-          `${this.weekday(d.t)}: ${this.n(d.v, 2)} kWh`,
+          `${this.weekday(d.t)}: ${this.n(d.v, 2)} kWh${d.temp !== null ? ` · ${this.n(d.temp, 1)} ${tempUnit}` : ""}`,
         )}</title></rect>`);
         parts.push(`<text class="bar-label" x="${cx.toFixed(1)}" y="${(plot.y1 - h - 3).toFixed(1)}" text-anchor="middle">${esc(this.n(d.v, d.v >= 100 ? 0 : 1))}</text>`);
       }
-      parts.push(`<text x="${cx.toFixed(1)}" y="${H - 2}" text-anchor="middle">${esc(current ? this.t("today") : this.weekday(d.t))}</text>`);
+      const dayY = hasTemp ? plot.y1 + 13 : H - 2;
+      parts.push(`<text x="${cx.toFixed(1)}" y="${dayY}" text-anchor="middle">${esc(current ? this.t("today") : this.weekday(d.t))}</text>`);
+      if (d.temp !== null) parts.push(`<text class="temp-label" x="${cx.toFixed(1)}" y="${H - 2}" text-anchor="middle">${esc(this.n(d.temp, 1))}°</text>`);
     });
-    return `<div class="section"><span>${esc(this.t("days"))}</span><span>kWh</span></div>
+    if (hasTemp) {
+      // Own scale for the temperature, padded so the line stays clear of the edges.
+      const lo = Math.min(...temps);
+      const hi = Math.max(...temps);
+      const pad = Math.max(1, (hi - lo) * 0.15);
+      const ty = (v) => plot.y1 - 4 - ((v - (lo - pad)) / (hi - lo + 2 * pad)) * (plot.y1 - plot.y0 - 8);
+      const pts = list.map((d, i) => (d.temp === null ? null : { x: plot.x0 + slot * (i + 0.5), y: ty(d.temp), d }));
+      let path = "";
+      let pen = false;
+      for (const p of pts) {
+        if (!p) {
+          pen = false;
+          continue;
+        }
+        path += `${pen ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}`;
+        pen = true;
+      }
+      parts.push(`<path class="temp-line" d="${path}"/>`);
+      for (const p of pts.filter(Boolean)) {
+        parts.push(`<circle class="temp-dot" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3"><title>${esc(
+          `${this.weekday(p.d.t)}: ${this.n(p.d.temp, 1)} ${tempUnit}`,
+        )}</title></circle>`);
+      }
+    }
+    const legend = hasTemp
+      ? `<span class="day-legend"><span><i class="swatch bar-swatch"></i>kWh</span><span><i class="swatch line-swatch"></i>${esc(this.t("mean_temp"))}</span></span>`
+      : "<span>kWh</span>";
+    return `<div class="section"><span>${esc(this.t("days"))}</span>${legend}</div>
       <button class="link chart" data-more="total"><svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(this.t("days"))}">${parts.join("")}</svg></button>`;
   }
 }

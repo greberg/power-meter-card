@@ -8,7 +8,7 @@ It shows:
 - energy used today
 - per-phase load (L1–L3) against your main fuse: power, current and voltage
 - a 24 h chart of the phases stacked (top edge = total), as 5-minute averages, with a hover tooltip and clickable legend to hide phases
-- energy per day for the last 7 days, from long-term statistics
+- energy per day for the last 7 days, from long-term statistics, optionally with a line for each day's mean outdoor temperature
 - the meter reading and current export
 
 Plain custom element: no build step, no external libraries. Follows your Home Assistant theme and language (Swedish and English).
@@ -44,6 +44,7 @@ fuse: 20
 | `icon` | `mdi:meter-electric` | Header icon. |
 | `hours_to_show` | `24` | Length of the power chart, in hours. |
 | `bucket_minutes` | `5` | Averaging interval for the power chart, in minutes. Lower shows more detail, higher is smoother. |
+| `temperature` | – | Temperature sensor, e.g. an outdoor sensor. Adds the daily mean temperature as a line to the energy-per-day chart. Needs long-term statistics (`state_class: measurement`). |
 | `days_to_show` | `7` | Number of days in the energy chart (2–31). |
 | `show_chart` | `true` | Show the power chart. |
 | `show_days` | `true` | Show the energy-per-day chart. |
